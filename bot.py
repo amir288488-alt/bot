@@ -1,3 +1,4 @@
+```python
 import asyncio
 import os
 import sqlite3
@@ -45,9 +46,12 @@ dp = Dispatcher()
 DB_FILE = "nova_vpn.db"
 
 
-def init_database():
+def get_connection():
+    return sqlite3.connect(DB_FILE)
 
-    connection = sqlite3.connect(DB_FILE)
+
+def init_database():
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute("""
@@ -68,16 +72,18 @@ init_database()
 
 
 # =========================================================
-# مدیریت اکانت‌های تست
+# افزودن اکانت تست
 # =========================================================
 
 def add_test_account(account):
-
-    connection = sqlite3.connect(DB_FILE)
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
-        "INSERT INTO test_accounts (account, used) VALUES (?, 0)",
+        """
+        INSERT INTO test_accounts (account, used)
+        VALUES (?, 0)
+        """,
         (account,)
     )
 
@@ -85,53 +91,68 @@ def add_test_account(account):
     connection.close()
 
 
+# =========================================================
+# دریافت اولین اکانت تست آزاد
+# =========================================================
+
 def get_next_test_account(user_id):
 
-    connection = sqlite3.connect(DB_FILE)
-    cursor = connection.cursor()
+    connection = get_connection()
 
-    # اولین اکانت استفاده‌نشده
-    cursor.execute("""
-        SELECT id, account
-        FROM test_accounts
-        WHERE used = 0
-        ORDER BY id ASC
-        LIMIT 1
-    """)
+    try:
+        cursor = connection.cursor()
 
-    row = cursor.fetchone()
+        # شروع تراکنش
+        connection.execute("BEGIN IMMEDIATE")
 
-    if not row:
+        cursor.execute("""
+            SELECT id, account
+            FROM test_accounts
+            WHERE used = 0
+            ORDER BY id ASC
+            LIMIT 1
+        """)
+
+        row = cursor.fetchone()
+
+        if not row:
+            connection.rollback()
+            return None
+
+        account_id = row[0]
+        account = row[1]
+
+        cursor.execute("""
+            UPDATE test_accounts
+            SET used = 1,
+                used_by = ?
+            WHERE id = ?
+              AND used = 0
+        """, (user_id, account_id))
+
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return None
+
+        connection.commit()
+
+        return account
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
         connection.close()
-        return None
 
-    account_id = row[0]
-    account = row[1]
 
-    # همان لحظه اکانت را مصرف‌شده می‌کنیم
-    cursor.execute("""
-        UPDATE test_accounts
-        SET used = 1,
-            used_by = ?
-        WHERE id = ?
-          AND used = 0
-    """, (user_id, account_id))
-
-    connection.commit()
-
-    # بررسی اینکه واقعاً خودمان آن را گرفتیم
-    if cursor.rowcount != 1:
-        connection.close()
-        return None
-
-    connection.close()
-
-    return account
-
+# =========================================================
+# لیست اکانت‌های تست
+# =========================================================
 
 def get_test_accounts():
 
-    connection = sqlite3.connect(DB_FILE)
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute("""
@@ -147,13 +168,20 @@ def get_test_accounts():
     return rows
 
 
+# =========================================================
+# حذف اکانت تست
+# =========================================================
+
 def delete_test_account(account_id):
 
-    connection = sqlite3.connect(DB_FILE)
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
-        "DELETE FROM test_accounts WHERE id = ?",
+        """
+        DELETE FROM test_accounts
+        WHERE id = ?
+        """,
         (account_id,)
     )
 
@@ -163,6 +191,34 @@ def delete_test_account(account_id):
     connection.close()
 
     return deleted
+
+
+# =========================================================
+# آمار تست‌ها
+# =========================================================
+
+def get_test_stats():
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT
+            COUNT(*),
+            SUM(CASE WHEN used = 0 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN used = 1 THEN 1 ELSE 0 END)
+        FROM test_accounts
+    """)
+
+    row = cursor.fetchone()
+
+    connection.close()
+
+    total = row[0] or 0
+    available = row[1] or 0
+    used = row[2] or 0
+
+    return total, available, used
 
 
 # =========================================================
@@ -221,11 +277,11 @@ def main_menu():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🛒 خرید سرویس",
+                    text="🟢 🛒 خرید سرویس",
                     callback_data="buy"
                 ),
                 InlineKeyboardButton(
-                    text="📦 سرویس‌های من",
+                    text="🔵 📦 سرویس‌های من",
                     callback_data="my_services"
                 )
             ],
@@ -237,7 +293,7 @@ def main_menu():
             ],
             [
                 InlineKeyboardButton(
-                    text="📖 راهنما",
+                    text="🔴 📖 راهنما",
                     callback_data="help"
                 )
             ]
@@ -275,7 +331,7 @@ def plans_menu():
 
 
 # =========================================================
-# منوی مدیریت تست برای ادمین
+# منوی مدیریت اکانت‌های تست
 # =========================================================
 
 def test_admin_menu():
@@ -298,6 +354,12 @@ def test_admin_menu():
                 InlineKeyboardButton(
                     text="🗑 حذف اکانت",
                     callback_data="admin_delete_test"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 آمار تست‌ها",
+                    callback_data="admin_test_stats"
                 )
             ],
             [
@@ -333,54 +395,82 @@ async def test_100(callback: CallbackQuery):
 
     user_id = callback.from_user.id
 
-    # گرفتن اولین اکانت آزاد
-    account = get_next_test_account(user_id)
+    try:
+
+        account = get_next_test_account(user_id)
+
+    except Exception as error:
+
+        print(f"Test account database error: {error}")
+
+        await callback.answer(
+            "❌ خطا در سیستم تست. دوباره تلاش کن.",
+            show_alert=True
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # اگر تست تمام شده باشد
+    # -----------------------------------------------------
 
     if not account:
 
-        await callback.message.edit_text(
-            "😔 <b>اکانت تست موجود نیست.</b>\n\n"
-            "تمام اکانت‌های تست ۱۰۰ مگ در حال حاضر استفاده شده‌اند.\n\n"
-            "لطفاً بعداً دوباره تلاش کن.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🔙 بازگشت",
-                            callback_data="back"
-                        )
-                    ]
-                ]
-            ),
-            parse_mode="HTML"
-        )
-
-        await callback.answer()
-        return
-
-    # ارسال تست
-    await callback.message.edit_text(
-        "🎁 <b>تست ۱۰۰ مگ شما آماده است!</b>\n\n"
-        "📦 حجم: <b>۱۰۰ مگابایت</b>\n"
-        "⏱ مدت: <b>تست</b>\n\n"
-        "🔗 <b>اکانت تست:</b>\n"
-        f"<code>{account}</code>\n\n"
-        "⚡ با تشکر از انتخاب Nova VPN ❤️",
-        reply_markup=InlineKeyboardMarkup(
+        keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="🏠 منوی اصلی",
+                        text="🔙 بازگشت",
                         callback_data="back"
                     )
                 ]
             ]
-        ),
+        )
+
+        await callback.message.edit_text(
+            "😔 <b>اکانت تست موجود نیست.</b>\n\n"
+            "تمام اکانت‌های تست ۱۰۰ مگ در حال حاضر استفاده شده‌اند.\n\n"
+            "⏳ لطفاً بعداً دوباره تلاش کن.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+        await callback.answer(
+            "❌ اکانت تست موجود نیست.",
+            show_alert=True
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ارسال اکانت تست
+    # -----------------------------------------------------
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🏠 منوی اصلی",
+                    callback_data="back"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
+        "🎁 <b>تست ۱۰۰ مگ شما آماده است!</b>\n\n"
+        "📦 حجم: <b>۱۰۰ مگابایت</b>\n"
+        "⏱ نوع: <b>اکانت تست</b>\n\n"
+        "🔗 <b>اکانت تست شما:</b>\n\n"
+        f"<code>{account}</code>\n\n"
+        "⚠️ این اکانت فقط یک بار قابل دریافت است.\n\n"
+        "⚡ با تشکر از انتخاب Nova VPN ❤️",
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
 
     await callback.answer(
-        "🎁 تست ۱۰۰ مگ برای شما ارسال شد."
+        "🎁 تست ۱۰۰ مگ ارسال شد."
     )
 
 
@@ -409,7 +499,16 @@ async def buy_service(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("plan_"))
 async def select_plan(callback: CallbackQuery):
 
-    index = int(callback.data.split("_")[1])
+    try:
+        index = int(callback.data.split("_")[1])
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "❌ سرویس نامعتبر است.",
+            show_alert=True
+        )
+
+        return
 
     if index < 0 or index >= len(PLANS):
 
@@ -459,7 +558,16 @@ async def select_plan(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("pay_"))
 async def payment(callback: CallbackQuery):
 
-    index = int(callback.data.split("_")[1])
+    try:
+        index = int(callback.data.split("_")[1])
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "❌ سرویس نامعتبر است.",
+            show_alert=True
+        )
+
+        return
 
     if index < 0 or index >= len(PLANS):
 
@@ -652,7 +760,16 @@ async def admin_send_link(callback: CallbackQuery):
 
         return
 
-    user_id = int(callback.data.split("_")[2])
+    try:
+        user_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "❌ آیدی مشتری نامعتبر است.",
+            show_alert=True
+        )
+
+        return
 
     if user_id not in pending_orders:
 
@@ -681,12 +798,43 @@ async def admin_send_link(callback: CallbackQuery):
 # =========================================================
 
 @dp.message(F.text)
-async def receive_link(message: Message):
+async def receive_text(message: Message):
 
     if message.from_user.id != ADMIN_ID:
         return
 
-    link = message.text.strip()
+    text = message.text.strip()
+
+    # -----------------------------------------------------
+    # اگر ادمین در حالت افزودن تست باشد
+    # -----------------------------------------------------
+
+    if ADMIN_ID in waiting_for_test_account:
+
+        if not text:
+
+            await message.answer(
+                "❌ اکانت خالی است. دوباره ارسال کن."
+            )
+
+            return
+
+        add_test_account(text)
+
+        waiting_for_test_account.discard(ADMIN_ID)
+
+        await message.answer(
+            "✅ <b>اکانت تست با موفقیت اضافه شد.</b>\n\n"
+            "اکانت در لیست تست‌ها قرار گرفت و برای کاربران قابل استفاده است.",
+            parse_mode="HTML",
+            reply_markup=test_admin_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # دریافت لینک اشتراک مشتری
+    # -----------------------------------------------------
 
     target_user_id = None
 
@@ -701,7 +849,7 @@ async def receive_link(message: Message):
         return
 
     pending_orders[target_user_id]["waiting_for_link"] = False
-    pending_orders[target_user_id]["link"] = link
+    pending_orders[target_user_id]["link"] = text
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -723,7 +871,7 @@ async def receive_link(message: Message):
 
                 "🔗 <b>لینک اشتراک شما:</b>\n\n"
 
-                f"<code>{link}</code>\n\n"
+                f"<code>{text}</code>\n\n"
 
                 "⚡ با تشکر از انتخاب Nova VPN ❤️"
             ),
@@ -848,7 +996,6 @@ async def back(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     waiting_for_receipt.discard(user_id)
-    waiting_for_test_account.discard(user_id)
 
     await callback.message.edit_text(
         WELCOME_TEXT,
@@ -867,7 +1014,7 @@ async def back(callback: CallbackQuery):
 
 
 # =========================================================
-# باز کردن پنل تست
+# /testadmin
 # =========================================================
 
 @dp.message(F.text == "/testadmin")
@@ -881,8 +1028,13 @@ async def test_admin(message: Message):
 
         return
 
+    total, available, used = get_test_stats()
+
     await message.answer(
         "🎁 <b>مدیریت اکانت‌های تست</b>\n\n"
+        f"📦 کل اکانت‌ها: <b>{total}</b>\n"
+        f"✅ اکانت‌های آزاد: <b>{available}</b>\n"
+        f"❌ استفاده‌شده: <b>{used}</b>\n\n"
         "از منوی زیر عملیات موردنظر را انتخاب کن:",
         reply_markup=test_admin_menu(),
         parse_mode="HTML"
@@ -890,7 +1042,7 @@ async def test_admin(message: Message):
 
 
 # =========================================================
-# بازگشت ادمین
+# بازگشت به پنل تست
 # =========================================================
 
 @dp.callback_query(F.data == "admin_back")
@@ -905,8 +1057,13 @@ async def admin_back(callback: CallbackQuery):
 
         return
 
+    total, available, used = get_test_stats()
+
     await callback.message.edit_text(
         "🎁 <b>مدیریت اکانت‌های تست</b>\n\n"
+        f"📦 کل اکانت‌ها: <b>{total}</b>\n"
+        f"✅ اکانت‌های آزاد: <b>{available}</b>\n"
+        f"❌ استفاده‌شده: <b>{used}</b>\n\n"
         "از منوی زیر عملیات موردنظر را انتخاب کن:",
         reply_markup=test_admin_menu(),
         parse_mode="HTML"
@@ -935,50 +1092,14 @@ async def admin_add_test(callback: CallbackQuery):
 
     await callback.message.answer(
         "➕ <b>افزودن اکانت تست</b>\n\n"
-        "اکانت/کانفیگ تست را در یک پیام ارسال کن.\n\n"
+        "اکانت/کانفیگ تست ۱۰۰ مگ را در یک پیام ارسال کن.\n\n"
         "مثلاً:\n"
         "<code>vless://....</code>\n\n"
-        "بعد از ارسال، اکانت به لیست تست‌ها اضافه می‌شود.",
+        "بعد از ارسال، اکانت به صورت خودکار ذخیره می‌شود.",
         parse_mode="HTML"
     )
 
     await callback.answer()
-
-
-# =========================================================
-# دریافت اکانت تست از ادمین
-# =========================================================
-
-@dp.message(F.text)
-async def receive_test_account(message: Message):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    if ADMIN_ID not in waiting_for_test_account:
-        return
-
-    account = message.text.strip()
-
-    if not account:
-
-        await message.answer(
-            "❌ اکانت خالی است."
-        )
-
-        return
-
-    add_test_account(account)
-
-    waiting_for_test_account.discard(ADMIN_ID)
-
-    await message.answer(
-        "✅ <b>اکانت تست با موفقیت اضافه شد.</b>\n\n"
-        f"🔗 اکانت:\n"
-        f"<code>{account}</code>",
-        parse_mode="HTML",
-        reply_markup=test_admin_menu()
-    )
 
 
 # =========================================================
@@ -1021,18 +1142,74 @@ async def admin_list_tests(callback: CallbackQuery):
                 status = "✅ آزاد"
                 user_info = ""
 
+            # برای جلوگیری از خراب شدن HTML
+            safe_account = (
+                account
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+
             lines.append(
                 f"━━━━━━━━━━━━━━\n"
                 f"🆔 شماره: <b>{account_id}</b>\n"
                 f"📊 وضعیت: <b>{status}</b>"
                 f"{user_info}\n"
-                f"🔗 <code>{account}</code>"
+                f"🔗 <code>{safe_account}</code>"
             )
 
         text = "\n".join(lines)
 
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 بروزرسانی",
+                    callback_data="admin_list_tests"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔙 بازگشت",
+                    callback_data="admin_back"
+                )
+            ]
+        ]
+    )
+
     await callback.message.edit_text(
         text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# آمار تست‌ها
+# =========================================================
+
+@dp.callback_query(F.data == "admin_test_stats")
+async def admin_test_stats(callback: CallbackQuery):
+
+    if callback.from_user.id != ADMIN_ID:
+
+        await callback.answer(
+            "⛔ دسترسی ندارید.",
+            show_alert=True
+        )
+
+        return
+
+    total, available, used = get_test_stats()
+
+    await callback.message.edit_text(
+        "📊 <b>آمار اکانت‌های تست</b>\n\n"
+        f"📦 کل اکانت‌ها: <b>{total}</b>\n\n"
+        f"✅ اکانت‌های آزاد: <b>{available}</b>\n\n"
+        f"❌ اکانت‌های استفاده‌شده: <b>{used}</b>\n\n"
+        "🎁 هر اکانت فقط یک بار تحویل داده می‌شود.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1109,7 +1286,7 @@ async def admin_delete_test(callback: CallbackQuery):
 
 
 # =========================================================
-# تأیید حذف اکانت
+# حذف اکانت انتخاب‌شده
 # =========================================================
 
 @dp.callback_query(F.data.startswith("delete_test_"))
@@ -1124,9 +1301,18 @@ async def delete_test(callback: CallbackQuery):
 
         return
 
-    account_id = int(
-        callback.data.split("_")[2]
-    )
+    try:
+        account_id = int(
+            callback.data.split("_")[2]
+        )
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "❌ شماره اکانت نامعتبر است.",
+            show_alert=True
+        )
+
+        return
 
     deleted = delete_test_account(account_id)
 
@@ -1144,7 +1330,57 @@ async def delete_test(callback: CallbackQuery):
             show_alert=True
         )
 
-    await admin_delete_test(callback)
+    # نمایش مجدد لیست حذف
+    accounts = get_test_accounts()
+
+    if not accounts:
+
+        await callback.message.edit_text(
+            "🗑 <b>حذف اکانت تست</b>\n\n"
+            "هیچ اکانتی باقی نمانده است.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔙 بازگشت",
+                            callback_data="admin_back"
+                        )
+                    ]
+                ]
+            ),
+            parse_mode="HTML"
+        )
+
+        return
+
+    buttons = []
+
+    for acc_id, account, used, used_by in accounts:
+
+        status = "❌ استفاده شده" if used else "✅ آزاد"
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🗑 #{acc_id} — {status}",
+                callback_data=f"delete_test_{acc_id}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="🔙 بازگشت",
+            callback_data="admin_back"
+        )
+    ])
+
+    await callback.message.edit_text(
+        "🗑 <b>حذف اکانت تست</b>\n\n"
+        "اکانت موردنظر را انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+        parse_mode="HTML"
+    )
 
 
 # =========================================================
@@ -1153,10 +1389,15 @@ async def delete_test(callback: CallbackQuery):
 
 async def main():
 
+    print("===================================")
     print("Nova VPN Bot Started")
+    print("Test account system: ENABLED")
+    print("Database: nova_vpn.db")
+    print("===================================")
 
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
